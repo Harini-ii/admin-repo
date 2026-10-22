@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg[binary]
+python-dotenv
+pydantic
+python-multipart
+python-jose[cryptography]
+pwdlib[argon2]
+email-validator
+
+UUID v4 — Random
+Example
+550e8400-e29b-41d4-a716-446655440000
+Recommended default
