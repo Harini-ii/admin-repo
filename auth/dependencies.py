@@ -55,7 +55,7 @@ def get_current_admin(
 
     # Validate admin ID
     try:
-        admin_id = int(admin_id)
+        admin_id = (admin_id)
     except (ValueError, TypeError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
