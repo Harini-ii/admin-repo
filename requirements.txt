@@ -8,6 +8,7 @@ python-multipart
 python-jose[cryptography]
 pwdlib[argon2]
 email-validator
+slowapi
 
 # UUID v4 — Random
 # Example
