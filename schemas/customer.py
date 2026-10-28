@@ -1,14 +1,20 @@
-from pydantic import BaseModel, EmailStr
+
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, EmailStr
 
 
 class CustomerResponse(BaseModel):
-    id: str
-    name: str | None = None
-    email: EmailStr
-    mobile: str | None = None
-    country: str | None = None
-    company: str | None = None
-    joined_at: object
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        from_attributes = True
+    customer_id: UUID
+    name: str | None = None
+    email: EmailStr | None = None
+    phone_number: str | None = None
+    role: str | None = None
+    company: str | None = None
+    country: str | None = None
+    profile_url: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

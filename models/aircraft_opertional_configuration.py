@@ -9,7 +9,7 @@ from database import Base
 
 class AircraftOperationalConfiguration(Base):
     __tablename__ = "AIRCRAFT_OPERATIONAL_CONFIGURATION_HJ"
-    __table_args__ = {"schema": "admin_HJ"}
+    __table_args__ = {"schema": "admin_hj"}
 
     id = Column(
         UUID(as_uuid=True),

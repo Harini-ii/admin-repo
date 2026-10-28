@@ -2,6 +2,7 @@ from pathlib import Path
 from sqlalchemy import text
 import shutil
 import uuid
+from sqlalchemy.sql import func
 from datetime import datetime
 from models.customer import Customer
 from typing import Literal
@@ -670,154 +671,94 @@ app.include_router(operators_router)
 # ============================================================
 
 
+@protected_router.post(
+    "/aircraft",
+    tags=["Admin Aircraft"],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_aircraft(
+    model: str = Form(..., min_length=1, max_length=100),
+    type: Literal["FLIGHT", "HELICOPTER"] = Form(...),
+    seating: int = Form(..., gt=0),
+    image: UploadFile = File(..., description="Aircraft image"),
+    db: Session = Depends(get_db),
+):
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    saved_file = None
 
+    try:
+        filename = image.filename or ""
+        extension = Path(filename).suffix.lower()
 
+        if (
+            extension not in allowed_extensions
+            or image.content_type not in allowed_types
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only JPG, JPEG, PNG, and WEBP image files are allowed",
+            )
 
-from typing import Literal
+        unique_filename = f"{uuid.uuid4().hex}{extension}"
+        file_path = AIRCRAFT_UPLOAD_DIR / unique_filename
+
+        # Save the uploaded image.
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(image.file, buffer)
+
+        saved_file = file_path
+        image_path = str(file_path).replace("\\", "/")
+
+        # Create the aircraft.
+        new_aircraft = Aircraft(
+            model=model.strip(),
+            type=type,
+            seating=seating,
+            image=image_path,
+        )
+
+        db.add(new_aircraft)
+        db.flush()
+
+        # Commit the aircraft record.
+        db.commit()
+        db.refresh(new_aircraft)
+
+        return {
+            "message": "Aircraft created successfully. Add its limits to create the operational configuration.",
+            "aircraft": {
+                "id": str(new_aircraft.id),
+                "model": new_aircraft.model,
+                "type": new_aircraft.type,
+                "seating": new_aircraft.seating,
+                "image": new_aircraft.image,
+            },
+        }
+
+    except HTTPException:
+        db.rollback()
+        if saved_file is not None:
+            saved_file.unlink(missing_ok=True)
+        raise
+
+    except Exception:
+        db.rollback()
+        if saved_file is not None:
+            saved_file.unlink(missing_ok=True)
+        raise
+
+    finally:
+        image.file.close()
 
 
 
 
 
 @protected_router.post(
-
-          "/aircraft",
-
-          tags=["Admin Aircraft"],
-
-          status_code=status.HTTP_201_CREATED,
-
+    "/aircraft/{aircraft_id}/limits",
+    tags=["Admin Aircraft"],
 )
-
-def create_aircraft(
-
-          model: str = Form(..., min_length=1, max_length=100),
-
-          type: Literal["FLIGHT", "HELICOPTER"] = Form(...),
-
-          seating: int = Form(..., gt=0),
-
-          image: UploadFile = File(..., description="Aircraft image"),
-
-          db: Session = Depends(get_db),
-
-):
-
-          allowed_types = {"image/jpeg", "image/png", "image/webp"}
-
-          allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-
-          saved_file = None
-
-
-
-          try:
-                    filename = image.filename or ""
-                    extension = Path(filename).suffix.lower()
-                    if (
-                              extension not in allowed_extensions
-                              or image.content_type not in allowed_types
-
-                    ):
-                              raise HTTPException(
-                                        status_code=status.HTTP_400_BAD_REQUEST,
-                                        detail="Only JPG, JPEG, and WEBP image files are allowed"
-                                        if False else
-                                        "Only JPG, JPEG, PNG, and WEBP image files are allowed",
-                              )
-                    unique_filename = f"{uuid.uuid4().hex}{extension}"
-
-                    file_path = AIRCRAFT_UPLOAD_DIR / unique_filename
-
-
-
-                    # Save the uploaded image to disk.
-
-                    with file_path.open("wb") as buffer:
-
-                              shutil.copyfileobj(image.file, buffer)
-
-
-
-                    saved_file = file_path
-
-                    image_path = str(file_path).replace("\\\\", "/")
-
-
-
-                    # Save aircraft details and the main image path.
-
-                    new_aircraft = Aircraft(
-
-                              model=model.strip(),
-
-                              type=type,
-
-                              seating=seating,
-
-                              image=image_path,
-
-                    )
-
-
-
-                    db.add(new_aircraft)
-
-                    db.commit()
-
-                    db.refresh(new_aircraft)
-
-
-
-                    return {
-
-                              "message": "Aircraft created successfully",
-
-                              "aircraft": {
-
-                                        "id": new_aircraft.id,
-
-                                        "model": new_aircraft.model,
-
-                                        "type": new_aircraft.type,
-
-                                        "seating": new_aircraft.seating,
-
-                                        "image": new_aircraft.image,
-
-                              },
-
-                    }
-
-
-
-          except HTTPException:
-
-                    db.rollback()
-
-                    if saved_file is not None:
-
-                              saved_file.unlink(missing_ok=True)
-
-                    raise
-
-          except Exception:
-
-                    db.rollback()
-
-                    if saved_file is not None:
-
-                              saved_file.unlink(missing_ok=True)
-
-                    raise
-
-          finally:
-
-                    image.file.close()
-
-
-
-@protected_router.post("/aircraft/{aircraft_id}/limits", tags=["Admin Aircraft"])
 def create_aircraft_limits(
     aircraft_id: UUID,
     limits: AircraftLimitsCreate,
@@ -831,29 +772,73 @@ def create_aircraft_limits(
 
     if aircraft is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Aircraft not found",
         )
 
-    aircraft.maximum_payload = limits.maximum_payload
-    aircraft.baggage_capacity = limits.baggage_capacity
-
     try:
+        # 1. Update the main aircraft table.
+        aircraft.maximum_payload = limits.maximum_payload
+        aircraft.baggage_capacity = limits.baggage_capacity
+
+        # 2. Find the corresponding operational configuration.
+        configuration = (
+            db.query(AircraftOperationalConfiguration)
+            .filter(
+                AircraftOperationalConfiguration.aircraft_id
+                == aircraft.id
+            )
+            .first()
+        )
+
+        # 3. Create it if it does not exist; otherwise update it.
+        if configuration is None:
+            configuration = AircraftOperationalConfiguration(
+                aircraft_id=aircraft.id,
+                maximum_payload=limits.maximum_payload,
+                baggage_capacity=limits.baggage_capacity,
+                configured_by=None,
+            )
+            db.add(configuration)
+        else:
+            configuration.maximum_payload = limits.maximum_payload
+            configuration.baggage_capacity = limits.baggage_capacity
+
+        # 4. Save both table changes together.
         db.commit()
+
         db.refresh(aircraft)
+        db.refresh(configuration)
+
+        return {
+            "message": "Aircraft limits and operational configuration saved successfully",
+            "aircraft": {
+                "id": str(aircraft.id),
+                "model": aircraft.model,
+                "maximum_payload": aircraft.maximum_payload,
+                "baggage_capacity": aircraft.baggage_capacity,
+            },
+            "operational_configuration": {
+                "id": str(configuration.id),
+                "aircraft_id": str(configuration.aircraft_id),
+                "maximum_payload": configuration.maximum_payload,
+                "baggage_capacity": configuration.baggage_capacity,
+                "configured_by": (
+                    str(configuration.configured_by)
+                    if configuration.configured_by
+                    else None
+                ),
+                "config_at": configuration.config_at,
+                "updated_at": configuration.updated_at,
+            },
+        }
+
     except Exception:
         db.rollback()
         raise HTTPException(
-            status_code=500,
-            detail="Failed to save aircraft limits",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save aircraft limits and operational configuration",
         )
-
-    return {
-        "message": "Aircraft limits saved successfully",
-        "aircraft_id": str(aircraft.id),
-        "maximum_payload": aircraft.maximum_payload,
-        "baggage_capacity": aircraft.baggage_capacity,
-    }
 
 # ------------------------------------------------------------
 
@@ -1308,6 +1293,8 @@ def delete_aircraft(
 
 
 # GET: Retrieve aircraft operational configuration
+
+# GET: Retrieve operational configuration by aircraft ID
 @protected_router.get(
     "/aircraft/{aircraft_id}/operational-configuration",
     response_model=AircraftOperationalConfigurationResponse,
@@ -1317,6 +1304,20 @@ def get_aircraft_configuration(
     aircraft_id: UUID,
     db: Session = Depends(get_db),
 ):
+    # Check that the aircraft exists in AIRCRAFT_HJ
+    aircraft = (
+        db.query(Aircraft)
+        .filter(Aircraft.id == aircraft_id)
+        .first()
+    )
+
+    if aircraft is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aircraft not found in AIRCRAFT_HJ",
+        )
+
+    # Retrieve its saved configuration
     configuration = (
         db.query(AircraftOperationalConfiguration)
         .filter(
@@ -1325,16 +1326,16 @@ def get_aircraft_configuration(
         .first()
     )
 
-    if not configuration:
+    if configuration is None:
         raise HTTPException(
-            status_code=404,
-            detail="Aircraft operational configuration not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Operational configuration not found for this aircraft",
         )
 
     return configuration
 
 
-# PUT: Update aircraft operational configuration
+# PUT: Update operational configuration by aircraft ID
 @protected_router.put(
     "/aircraft/{aircraft_id}/operational-configuration",
     response_model=AircraftOperationalConfigurationResponse,
@@ -1353,30 +1354,37 @@ def update_aircraft_configuration(
         .first()
     )
 
-    if not configuration:
+    if configuration is None:
         raise HTTPException(
-            status_code=404,
-            detail="Aircraft operational configuration not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Operational configuration not found for this aircraft",
         )
 
     updates = data.model_dump(exclude_unset=True)
 
     if not updates:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="No fields provided for update",
         )
 
     for field, value in updates.items():
         setattr(configuration, field, value)
 
-    db.commit()
-    db.refresh(configuration)
+    try:
+        db.commit()
+        db.refresh(configuration)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update operational configuration",
+        )
 
     return configuration
 
 
-# DELETE: Delete aircraft operational configuration
+# DELETE: Delete operational configuration by aircraft ID
 @protected_router.delete(
     "/aircraft/{aircraft_id}/operational-configuration",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -1394,17 +1402,23 @@ def delete_aircraft_configuration(
         .first()
     )
 
-    if not configuration:
+    if configuration is None:
         raise HTTPException(
-            status_code=404,
-            detail="Aircraft operational configuration not found",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Operational configuration not found for this aircraft",
         )
 
-    db.delete(configuration)
-    db.commit()
+    try:
+        db.delete(configuration)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete operational configuration",
+        )
 
     return None
-
 
 # ============================================================
 
@@ -1508,123 +1522,81 @@ def get_all_customers(
 
 
 
+# 
 # --------------------------------------------------------
-
 # GET ALL CUSTOMERS
-
 # --------------------------------------------------------
-
-
-
-@protected_router.get("/customers", tags=["Admin Customers"])
-
-def get_customers(db: Session = Depends(get_db)):
-
-
-
-          customers = (
-
-                    db.query(Customer)
-
-                    .order_by(Customer.created_at.desc())
-
-                    .all()
-
-          )
-
-
-
-          return {
-
-                    "count": len(customers),
-
-                    "customers": [
-
-                              {
-
-                                        "customer_id": customer.customer_id,
-
-                                        "name": customer.name,
-
-                                        "email": customer.email,
-
-                                        "phone_number": customer.phone_number,
-
-                                        "created_at": customer.created_at,
-
-                              }
-
-                              for customer in customers
-
-                    ],
-
-          }
-
-
-
-
-
-# --------------------------------------------------------
-
-# GET CUSTOMER BY ID
-
-# --------------------------------------------------------
-
-
 
 @protected_router.get(
-
-          "/customers/{customer_id}",
-
-          tags=["Admin Customers"],
-
+    "/customers",
+    tags=["Admin Customers"],
 )
+def get_customers(db: Session = Depends(get_db)):
 
+    customers = (
+        db.query(Customer)
+        .order_by(Customer.created_at.desc())
+        .all()
+    )
+
+    return {
+        "count": len(customers),
+        "customers": [
+            {
+                "customer_id": customer.customer_id,
+                "name": customer.name,
+                "email": customer.email,
+                "phone_number": customer.phone_number,
+                "role": customer.role,
+                "company": customer.company,
+                "country": customer.country,
+                "profile_url": customer.profile_url,
+                "created_at": customer.created_at,
+                "updated_at": customer.updated_at,
+            }
+            for customer in customers
+        ],
+    }
+
+
+# 
+# --------------------------------------------------------
+# GET CUSTOMER BY ID
+# --------------------------------------------------------
+
+@protected_router.get(
+    "/customers/{customer_id}",
+    tags=["Admin Customers"],
+)
 def get_customer(
-
-          customer_id: UUID,
-
-          db: Session = Depends(get_db),
-
+    customer_id: UUID,
+    db: Session = Depends(get_db),
 ):
 
-          customer = (
+    customer = (
+        db.query(Customer)
+        .filter(Customer.customer_id == customer_id)
+        .first()
+    )
 
-                    db.query(Customer)
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found",
+        )
 
-                    .filter(Customer.customer_id == customer_id)
-
-                    .first()
-
-          )
-
-
-
-          if not customer:
-
-                    raise HTTPException(
-
-                              status_code=status.HTTP_404_NOT_FOUND,
-
-                              detail="Customer not found",
-
-                    )
-
-
-
-          return {
-
-                    "customer_id": customer.customer_id,
-
-                    "name": customer.name,
-
-                    "email": customer.email,
-
-                    "phone_number": customer.phone_number,
-
-                    "created_at": customer.created_at,
-
-          }
+    return {
+        "customer_id": customer.customer_id,
+        "name": customer.name,
+        "email": customer.email,
+        "phone_number": customer.phone_number,
+        "role": customer.role,
+        "company": customer.company,
+        "country": customer.country,
+        "profile_url": customer.profile_url,
+        "created_at": customer.created_at,
+        "updated_at": customer.updated_at,
+    }
 
 # ============================================================
 

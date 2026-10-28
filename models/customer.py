@@ -18,10 +18,17 @@ class Customer(Base):
         index=True,
     )
 
-    name = Column(String(150))
-    email = Column(String(255))
-    phone_number = Column(String(30))
-    password = Column(String(255))
-    created_at = Column(DateTime)
-    country = Column(String(100), nullable=True)
+    name = Column(String(150), nullable=True)
+    email = Column(String(255), nullable=True)
+    phone_number = Column(String(30), nullable=True)
+
+    # Sensitive field: never return this in an API response.
+    password = Column(String(255), nullable=True)
+
+    role = Column(String(100), nullable=True)
     company = Column(String(150), nullable=True)
+    country = Column(String(100), nullable=True)
+    profile_url = Column(String(500), nullable=True)
+
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
