@@ -2910,40 +2910,42 @@ from uuid import UUID
 # These aliases make the response compatible with CustomerRequestResponse.
 CUSTOMER_SOURCE_SELECT = """
     SELECT
-        "ID" AS id,
-        "REQUEST_NUMBER" AS request_number,
-        "REQUEST_TYPE" AS request_type,
-        "CUSTOMER_ID" AS customer_id,
-        "CUSTOMER_NAME" AS customer_name,
-        "CUSTOMER_EMAIL" AS customer_email,
-        "CUSTOMER_MOBILE" AS customer_mobile,
-        "STATUS" AS status,
-        "DESTINATION" AS destination,
-        "IDENTITY_DOCUMENT" AS identity_document,
-        "MODE" AS mode,
-        "ACCESS" AS access,
-        "SERVICE_TYPE" AS service_type,
-        "SERVICE_SUB_TYPE" AS service_sub_type,
-        "PEOPLE_COUNT" AS people_count,
-        "BUDGET" AS budget,
-        "CURRENCY" AS currency,
-        "DEPARTMENT" AS department,
-        "START_DATE" AS start_date,
-        "END_DATE" AS end_date,
-        "TRIP_TYPE" AS trip_type,
-        "ADDITIONAL_REQUIREMENTS" AS additional_requirements,
-        "CUSTOMER_DETAILS" AS customer_details,
-        "SERVICE_DETAILS" AS service_details,
-        "REQUEST_MODE" AS request_mode,
-        "CREATED_AT" AS created_at,
-        "UPDATED_AT" AS updated_at
+        id,
+        request_number,
+        request_type,
+        customer_id,
+        customer_name,
+        customer_email,
+        customer_mobile,
+        status,
+        destination,
+        identity_document,
+        mode,
+        access,
+        service_type,
+        service_sub_type,
+        people_count,
+        budget,
+        currency,
+        department,
+        start_date,
+        end_date,
+        trip_type,
+        additional_requirements,
+        customer_details,
+        service_details,
+        request_mode,
+        created_at,
+        updated_at
     FROM customer_hj."CUSTOMER_REQUESTS"
 """
 
 
+# ------------------------------------------------------------
+# HELPER: GET CUSTOMER-SIDE REQUEST
+# ------------------------------------------------------------
 
-
-def get_source_customer_request(db, request_id):
+def get_source_customer_request(db: Session, request_id: UUID):
     query = text("""
         SELECT *
         FROM customer_hj."CUSTOMER_REQUESTS"
@@ -2952,7 +2954,7 @@ def get_source_customer_request(db, request_id):
 
     result = db.execute(
         query,
-        {"request_id": str(request_id)}
+        {"request_id": str(request_id)},
     ).mappings().first()
 
     if not result:
@@ -2960,7 +2962,6 @@ def get_source_customer_request(db, request_id):
 
     request_data = dict(result)
 
-    # Convert values to the types expected by the response schema
     if request_data.get("request_number") is not None:
         request_data["request_number"] = str(
             request_data["request_number"]
@@ -2974,34 +2975,78 @@ def get_source_customer_request(db, request_id):
     return request_data
 
 
+# ------------------------------------------------------------
+# HELPER: GET ADMIN-SIDE REQUEST
+# ------------------------------------------------------------
+
 def get_admin_customer_request(db: Session, request_id: UUID):
-    """Return an Admin-owned request from the Admin schema, if present."""
-    request = (
+    return (
         db.query(CustomerRequest)
         .filter(CustomerRequest.id == request_id)
         .first()
     )
-    return request
 
+
+# ------------------------------------------------------------
+# HELPER: IDENTIFY REQUEST OWNER
+# ------------------------------------------------------------
 
 def get_customer_request_owner(db: Session, request_id: UUID):
     """
-    Source-first lookup:
-    1. Customer-created request
-    2. Admin-created request
+    Find the request in this order:
+    1. Customer-created request.
+    2. Admin-created request.
     """
-    source_request = get_source_customer_request(db, request_id)
 
-    if source_request:
-        return "customer", source_request
+    customer_request = get_source_customer_request(
+        db,
+        request_id,
+    )
 
-    admin_request = get_admin_customer_request(db, request_id)
+    if customer_request:
+        return "customer", customer_request
+
+    admin_request = get_admin_customer_request(
+        db,
+        request_id,
+    )
 
     if admin_request:
         return "admin", admin_request
 
     return None, None
 
+
+# ------------------------------------------------------------
+# HELPER: NORMALIZE REQUEST FOR RESPONSE
+# ------------------------------------------------------------
+
+def normalize_customer_request(request):
+    """
+    Convert ORM objects and SQL mapping dictionaries into
+    dictionaries that can be sorted consistently.
+    """
+
+    if isinstance(request, dict):
+        data = dict(request)
+    else:
+        data = {
+            column.name: getattr(request, column.name)
+            for column in request.__table__.columns
+        }
+
+    if data.get("request_number") is not None:
+        data["request_number"] = str(data["request_number"])
+
+    if data.get("customer_id") is not None:
+        data["customer_id"] = str(data["customer_id"])
+
+    return data
+
+
+# ------------------------------------------------------------
+# POST: CREATE CUSTOMER REQUEST
+# ------------------------------------------------------------
 
 @protected_router.post(
     "/customer-requests",
@@ -3012,37 +3057,53 @@ def create_customer_request(
     payload: CustomerRequestCreate,
     db: Session = Depends(get_db),
 ):
-    # Admin POST creates a record ONLY in admin_hj.
+    request_data = payload.model_dump()
+
+    # Check for a duplicate request number in the Admin table.
     existing_admin = (
         db.query(CustomerRequest)
-        .filter(CustomerRequest.request_number == payload.request_number)
+        .filter(
+            CustomerRequest.request_number
+            == payload.request_number
+        )
         .first()
     )
 
-    existing_source = db.execute(
+    # Check for a duplicate request number in the Customer table.
+    existing_customer = db.execute(
         text("""
             SELECT 1
             FROM customer_hj."CUSTOMER_REQUESTS"
-            WHERE "REQUEST_NUMBER" = :request_number
+            WHERE request_number = :request_number
             LIMIT 1
         """),
         {"request_number": payload.request_number},
     ).first()
 
-    if existing_admin or existing_source:
+    if existing_admin or existing_customer:
         raise HTTPException(
             status_code=409,
             detail="Customer request number already exists",
         )
 
-    request = CustomerRequest(**payload.model_dump())
+    # This POST creates the request in the Admin table only.
+    request = CustomerRequest(**request_data)
 
-    db.add(request)
-    db.commit()
-    db.refresh(request)
+    try:
+        db.add(request)
+        db.commit()
+        db.refresh(request)
+
+    except Exception:
+        db.rollback()
+        raise
 
     return request
 
+
+# ------------------------------------------------------------
+# GET: LIST CUSTOMER AND ADMIN REQUESTS
+# ------------------------------------------------------------
 
 @protected_router.get(
     "/customer-requests",
@@ -3055,32 +3116,38 @@ def list_customer_requests(
     customer_id: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    # Get customer-created records from the customer schema.
+    # Build the Customer-side query.
     source_sql = CUSTOMER_SOURCE_SELECT
     source_conditions = []
     source_params = {}
 
     if status:
-        source_conditions.append('"STATUS" ILIKE :status')
+        source_conditions.append("status ILIKE :status")
         source_params["status"] = status
 
     if request_type:
-        source_conditions.append('"REQUEST_TYPE" ILIKE :request_type')
+        source_conditions.append(
+            "request_type ILIKE :request_type"
+        )
         source_params["request_type"] = request_type
 
     if customer_id:
-        source_conditions.append('"CUSTOMER_ID" = :customer_id')
+        source_conditions.append(
+            "customer_id = :customer_id"
+        )
         source_params["customer_id"] = customer_id
 
     if source_conditions:
-        source_sql += " WHERE " + " AND ".join(source_conditions)
+        source_sql += (
+            " WHERE " + " AND ".join(source_conditions)
+        )
 
-    source_rows = db.execute(
+    customer_rows = db.execute(
         text(source_sql),
         source_params,
     ).mappings().all()
 
-    # Get Admin-created records from the Admin schema.
+    # Build the Admin-side query.
     admin_query = db.query(CustomerRequest)
 
     if status:
@@ -3100,17 +3167,29 @@ def list_customer_requests(
 
     admin_rows = admin_query.all()
 
-    # Combine the results for display; no records are copied between tables.
-    results = [dict(row) for row in source_rows]
-    results.extend(admin_rows)
+    # Normalize both result types before combining and sorting.
+    results = [
+        normalize_customer_request(dict(row))
+        for row in customer_rows
+    ]
 
+    results.extend(
+        normalize_customer_request(row)
+        for row in admin_rows
+    )
+
+    # Sort newest requests first.
     results.sort(
-        key=lambda item: item.created_at,
+        key=lambda item: item.get("created_at") or datetime.min,
         reverse=True,
     )
 
     return results
 
+
+# ------------------------------------------------------------
+# GET: REQUEST BY ID
+# ------------------------------------------------------------
 
 @protected_router.get(
     "/customer-requests/{request_id}",
@@ -3121,7 +3200,10 @@ def get_customer_request(
     request_id: UUID,
     db: Session = Depends(get_db),
 ):
-    owner, request = get_customer_request_owner(db, request_id)
+    owner, request = get_customer_request_owner(
+        db,
+        request_id,
+    )
 
     if request is None:
         raise HTTPException(
@@ -3132,6 +3214,10 @@ def get_customer_request(
     return request
 
 
+# ------------------------------------------------------------
+# GET: CUSTOMER-SIDE REQUEST BY ID
+# ------------------------------------------------------------
+
 @protected_router.get(
     "/customer-requests/{request_id}/customer",
     response_model=CustomerRequestResponse,
@@ -3141,8 +3227,10 @@ def get_customer_request_details(
     request_id: UUID,
     db: Session = Depends(get_db),
 ):
-    # This endpoint specifically retrieves the customer-side request.
-    request = get_source_customer_request(db, request_id)
+    request = get_source_customer_request(
+        db,
+        request_id,
+    )
 
     if request is None:
         raise HTTPException(
@@ -3152,6 +3240,10 @@ def get_customer_request_details(
 
     return request
 
+
+# ------------------------------------------------------------
+# PATCH: UPDATE CUSTOMER REQUEST
+# ------------------------------------------------------------
 
 @protected_router.patch(
     "/customer-requests/{request_id}",
@@ -3163,7 +3255,10 @@ def update_customer_request(
     payload: CustomerRequestUpdate,
     db: Session = Depends(get_db),
 ):
-    owner, request = get_customer_request_owner(db, request_id)
+    owner, request = get_customer_request_owner(
+        db,
+        request_id,
+    )
 
     if request is None:
         raise HTTPException(
@@ -3176,11 +3271,15 @@ def update_customer_request(
     if not updates:
         return request
 
-    if "request_number" in updates and updates["request_number"]:
-        # Check for duplicate request numbers in both tables,
-        # excluding the current record from its owning table.
+    # Check duplicate request numbers when the number changes.
+    if (
+        "request_number" in updates
+        and updates["request_number"] is not None
+    ):
+        new_request_number = updates["request_number"]
+
         admin_duplicate_query = db.query(CustomerRequest).filter(
-            CustomerRequest.request_number == updates["request_number"]
+            CustomerRequest.request_number == new_request_number
         )
 
         if owner == "admin":
@@ -3190,67 +3289,80 @@ def update_customer_request(
 
         admin_duplicate = admin_duplicate_query.first()
 
-        source_duplicate_sql = """
+        customer_duplicate_sql = """
             SELECT 1
             FROM customer_hj."CUSTOMER_REQUESTS"
-            WHERE "REQUEST_NUMBER" = :request_number
+            WHERE request_number = :request_number
         """
 
-        source_params = {
-            "request_number": updates["request_number"]
+        customer_duplicate_params = {
+            "request_number": new_request_number,
         }
 
         if owner == "customer":
-            source_duplicate_sql += ' AND "ID" != :request_id'
-            source_params["request_id"] = str(request_id)
+            customer_duplicate_sql += " AND id != :request_id"
+            customer_duplicate_params["request_id"] = str(
+                request_id
+            )
 
-        source_duplicate = db.execute(
-            text(source_duplicate_sql + " LIMIT 1"),
-            source_params,
+        customer_duplicate = db.execute(
+            text(customer_duplicate_sql + " LIMIT 1"),
+            customer_duplicate_params,
         ).first()
 
-        if admin_duplicate or source_duplicate:
+        if admin_duplicate or customer_duplicate:
             raise HTTPException(
                 status_code=409,
                 detail="Customer request number already exists",
             )
 
+    # Update Admin-owned requests using SQLAlchemy ORM.
     if owner == "admin":
-        # Update only admin_hj."CUSTOMER_REQUESTS_HJ".
         for field, value in updates.items():
+            if not hasattr(request, field):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported request field: {field}",
+                )
+
             setattr(request, field, value)
 
-        db.commit()
-        db.refresh(request)
+        try:
+            db.commit()
+            db.refresh(request)
+
+        except Exception:
+            db.rollback()
+            raise
+
         return request
 
-    # Update only customer_hj."CUSTOMER_REQUESTS".
-    # Whitelist the column names to prevent arbitrary SQL identifiers.
+    # Update Customer-owned requests using a field whitelist.
     source_columns = {
-        "request_number": "REQUEST_NUMBER",
-        "request_type": "REQUEST_TYPE",
-        "customer_id": "CUSTOMER_ID",
-        "customer_name": "CUSTOMER_NAME",
-        "customer_email": "CUSTOMER_EMAIL",
-        "customer_mobile": "CUSTOMER_MOBILE",
-        "status": "STATUS",
-        "destination": "DESTINATION",
-        "identity_document": "IDENTITY_DOCUMENT",
-        "mode": "MODE",
-        "access": "ACCESS",
-        "service_type": "SERVICE_TYPE",
-        "service_sub_type": "SERVICE_SUB_TYPE",
-        "people_count": "PEOPLE_COUNT",
-        "budget": "BUDGET",
-        "currency": "CURRENCY",
-        "department": "DEPARTMENT",
-        "start_date": "START_DATE",
-        "end_date": "END_DATE",
-        "trip_type": "TRIP_TYPE",
-        "additional_requirements": "ADDITIONAL_REQUIREMENTS",
-        "customer_details": "CUSTOMER_DETAILS",
-        "service_details": "SERVICE_DETAILS",
-        "request_mode": "REQUEST_MODE",
+        "request_number": "request_number",
+        "request_type": "request_type",
+        "customer_id": "customer_id",
+        "customer_name": "customer_name",
+        "customer_email": "customer_email",
+        "customer_mobile": "customer_mobile",
+        "status": "status",
+        "destination": "destination",
+        "identity_document": "identity_document",
+        "mode": "mode",
+        "access": "access",
+        "service_type": "service_type",
+        "service_sub_type": "service_sub_type",
+        "people_count": "people_count",
+        "budget": "budget",
+        "currency": "currency",
+        "department": "department",
+        "start_date": "start_date",
+        "end_date": "end_date",
+        "trip_type": "trip_type",
+        "additional_requirements": "additional_requirements",
+        "customer_details": "customer_details",
+        "service_details": "service_details",
+        "request_mode": "request_mode",
     }
 
     unsupported_fields = set(updates) - set(source_columns)
@@ -3264,27 +3376,32 @@ def update_customer_request(
             ),
         )
 
+    # Column names come only from the whitelist above.
     set_clauses = [
-        f'"{source_columns[field]}" = :{field}'
+        f"{source_columns[field]} = :{field}"
         for field in updates
     ]
-    set_clauses.append('"UPDATED_AT" = NOW()')
+
+    set_clauses.append("updated_at = NOW()")
 
     params = dict(updates)
     params["request_id"] = str(request_id)
 
+    update_sql = (
+        """
+        UPDATE customer_hj."CUSTOMER_REQUESTS"
+        SET
+        """
+        + ", ".join(set_clauses)
+        + """
+        WHERE id = :request_id
+        RETURNING id
+        """
+    )
+
     try:
         result = db.execute(
-            text(
-                """
-                UPDATE customer_hj."CUSTOMER_REQUESTS"
-                SET """
-                + ", ".join(set_clauses)
-                + """
-                WHERE "ID" = :request_id
-                RETURNING "ID"
-                """
-            ),
+            text(update_sql),
             params,
         ).first()
 
@@ -3300,11 +3417,15 @@ def update_customer_request(
     except HTTPException:
         db.rollback()
         raise
+
     except Exception:
         db.rollback()
         raise
 
-    updated_request = get_source_customer_request(db, request_id)
+    updated_request = get_source_customer_request(
+        db,
+        request_id,
+    )
 
     if updated_request is None:
         raise HTTPException(
@@ -3315,6 +3436,10 @@ def update_customer_request(
     return updated_request
 
 
+# ------------------------------------------------------------
+# DELETE: CUSTOMER REQUEST
+# ------------------------------------------------------------
+
 @protected_router.delete(
     "/customer-requests/{request_id}",
     tags=["Customer Requests"],
@@ -3323,7 +3448,10 @@ def delete_customer_request(
     request_id: UUID,
     db: Session = Depends(get_db),
 ):
-    owner, request = get_customer_request_owner(db, request_id)
+    owner, request = get_customer_request_owner(
+        db,
+        request_id,
+    )
 
     if request is None:
         raise HTTPException(
@@ -3331,8 +3459,8 @@ def delete_customer_request(
             detail="Customer request not found",
         )
 
+    # Delete an Admin-owned request.
     if owner == "admin":
-        # Preserve the existing Admin-side related-record cleanup.
         delete_request_documents(
             db,
             CustomerRequestDocument,
@@ -3347,27 +3475,31 @@ def delete_customer_request(
 
         try:
             db.commit()
+
         except Exception:
             db.rollback()
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Cannot delete this request because related records "
-                    "still reference it."
+                    "Cannot delete this request because related "
+                    "records still reference it."
                 ),
             )
 
         return {
-            "message": "Admin-created customer request deleted successfully"
+            "message": (
+                "Admin-created customer request "
+                "deleted successfully"
+            )
         }
 
-    # Customer-owned request: delete only from the customer schema.
-    # Do not delete the Admin-side request or its related records.
+    # Delete a Customer-owned request.
+    # NOTE: The document table's actual column names must be verified.
     try:
         db.execute(
             text("""
                 DELETE FROM customer_hj."CUSTOMER_REQUEST_DOCUMENTS"
-                WHERE "REQUEST_ID" = :request_id
+                WHERE request_id = :request_id
             """),
             {"request_id": str(request_id)},
         )
@@ -3375,8 +3507,8 @@ def delete_customer_request(
         result = db.execute(
             text("""
                 DELETE FROM customer_hj."CUSTOMER_REQUESTS"
-                WHERE "ID" = :request_id
-                RETURNING "ID"
+                WHERE id = :request_id
+                RETURNING id
             """),
             {"request_id": str(request_id)},
         ).first()
@@ -3393,13 +3525,14 @@ def delete_customer_request(
     except HTTPException:
         db.rollback()
         raise
+
     except Exception:
         db.rollback()
         raise HTTPException(
             status_code=409,
             detail=(
-                "Cannot delete this customer request because related "
-                "records still reference it."
+                "Cannot delete this customer request because "
+                "related records still reference it."
             ),
         )
 
@@ -3407,11 +3540,20 @@ def delete_customer_request(
         "message": "Customer-created request deleted successfully"
     }
 
-def get_sales_request_from_source(db, request_id=None):
+
+# ------------------------------------------------------------
+# HELPER: GET SALES REQUESTS FROM SOURCE TABLE
+# ------------------------------------------------------------
+
+def get_sales_request_from_source(
+    db: Session,
+    request_id: Optional[UUID] = None,
+):
     query = """
         SELECT *
         FROM sales_hj."SALES_REQUESTS_HJ"
     """
+
     params = {}
 
     if request_id is not None:
@@ -3421,19 +3563,22 @@ def get_sales_request_from_source(db, request_id=None):
     result = db.execute(
         text(query),
         params,
-    ).mappings()
+    ).mappings().all()
 
     rows = [dict(row) for row in result]
 
     for row in rows:
         if row.get("request_number") is not None:
-            row["request_number"] = str(row["request_number"])
+            row["request_number"] = str(
+                row["request_number"]
+            )
 
         if row.get("customer_id") is not None:
-            row["customer_id"] = str(row["customer_id"])
+            row["customer_id"] = str(
+                row["customer_id"]
+            )
 
     return rows
-
 # ============================================================
 # SALES REQUESTS
 # ============================================================
